@@ -1,7 +1,7 @@
 ---
 title: SQL Hell, Warm Up
 date: "2023-01-07"
-format: hugo-md
+format: html
 categories:
     - DuckDB
     - Bad Ideas

@@ -1,0 +1,183 @@
+---
+title: Advent of Code 2022, Day 2
+date: "2023-01-15"
+format: html
+categories:
+    - DuckDB
+    - Bad Ideas
+    - Data Horror
+---
+
+Problem 2 [link here](https://adventofcode.com/2022/day/2).
+
+## Boilerplate for Quarto
+
+```{r}
+library("DBI")
+db = dbConnect(duckdb::duckdb(), dbdir=":memory:")
+knitr::opts_chunk$set(connection="db")
+```
+
+## Set up the database
+
+Set up the database, read in the inputs.
+
+```{sql}
+CREATE OR REPLACE TABLE rps_guide (move VARCHAR, response VARCHAR);
+COPY rps_guide FROM 'input.csv' (DELIMITER ' ');
+```
+
+Validate row counts.
+
+```{sql}
+SELECT COUNT(*) FROM rps_guide
+```
+
+```{bash}
+wc -l input.csv
+```
+
+Validate the first few rows.
+
+```{sql}
+SELECT * FROM rps_guide LIMIT 10
+```
+
+```{bash}
+head -n 10 input.csv
+```
+
+Everything looks good, input wise. 
+
+## Part 1
+
+Now we need a to convert the move / response pairs to scores. 
+BUT it's worth noting that case statement between A/B/C and X/Y/Z is gonna get nasty, so the first step would be to convert X/Y/Z into A/B/C.
+
+```{sql}
+CREATE OR REPLACE VIEW rps_normalized AS (
+    SELECT
+        move,
+        CASE
+            WHEN response = 'X' THEN 'A'
+            WHEN response = 'Y' THEN 'B'
+            WHEN response = 'Z' THEN 'C'
+            ELSE NULL
+        END AS response
+    FROM rps_guide
+);
+```
+
+I don't trust data so I'm gonna check for nulls on our new column.
+
+```{sql}
+SELECT 
+    *
+FROM rps_normalized 
+WHERE 
+    response IS NULL OR 
+    move NOT IN ('A', 'B', 'C')
+```
+
+Whew okay we're good. Now to compute the score.
+
+* A beats C
+* B beats A
+* C beats B
+
+```{sql}
+CREATE OR REPLACE VIEW rps_scored AS (
+    SELECT
+        move,
+        response,
+        CASE
+            WHEN move = response THEN 3
+            WHEN (response = 'B') AND (move = 'C') THEN 0
+            WHEN (response = 'B') AND (move = 'A') THEN 6
+            WHEN (response = 'C') AND (move = 'A') THEN 0
+            WHEN (response = 'C') AND (move = 'B') THEN 6
+            WHEN (response = 'A') AND (move = 'B') THEN 0
+            WHEN (response = 'A') AND (move = 'C') THEN 6
+        END AS outcome_score,
+        CASE
+            WHEN response = 'A' THEN 1
+            WHEN response = 'B' THEN 2
+            WHEN response = 'C' THEN 3
+        END AS shape_score,
+        outcome_score + shape_score AS total_score,
+    FROM rps_normalized
+)
+```
+
+Here's what that view looks like.
+
+```{sql}
+SELECT * FROM rps_scored LIMIT 10
+```
+
+Okay so that normalization didn't save us a whole lot. 
+Probably could have gotten more clever but whatevs it's easy to see. 
+Now for the answer.
+
+```{sql}
+SELECT SUM(total_score) FROM rps_scored
+```
+
+## Part 2
+
+Now it gets interesting. 
+We need a new version of our `rps_normalized` view that picks our shape for us. 
+If we update that view and keep the same schema, we can keep our `rps_scored` view the same, theoretically, and then run the same query to get the new answer.
+
+* X = lose
+* Y = draw
+* Z = win
+
+The downside here is that our case statement's gonna get pretty cumbersome real quick. 
+We can replace it with a join if we manually make a table that maps to what we need.
+
+* A beats C
+* B beats A
+* C beats B
+
+```{sql}
+CREATE OR REPLACE TABLE rps_decoder (move VARCHAR, wld VARCHAR, response VARCHAR);
+INSERT INTO rps_decoder (move, wld, response) VALUES
+('A', 'X', 'C'),
+('A', 'Y', 'A'),
+('A', 'Z', 'B'),
+('B', 'X', 'A'),
+('B', 'Y', 'B'),
+('B', 'Z', 'C'),
+('C', 'X', 'B'),
+('C', 'Y', 'C'),
+('C', 'Z', 'A');
+```
+
+```{sql}
+CREATE OR REPLACE VIEW rps_normalized AS (
+    SELECT
+        guide.move,
+        decoder.response,
+    FROM rps_guide AS guide
+    INNER JOIN rps_decoder AS decoder
+        ON guide.move = decoder.move AND 
+        guide.response = decoder.wld
+);
+```
+
+Okay let's check out our updated `rps_scored` view.
+
+```{sql}
+SELECT * FROM rps_scored LIMIT 10;
+```
+
+... and the answer.
+
+```{sql}
+SELECT SUM(total_score) FROM rps_scored
+```
+
+This one was way easier with SQL because it was basically a transformation on the input columns.
+A data frame / SQL table is a very natural fit for this problem.
+That will very much _not_ be the case for many of the others.
