@@ -1,0 +1,382 @@
+---
+title: Advent of Code 2022, Day 3
+date: 2023-01-15
+format: html
+categories:
+    - DuckDB
+    - Bad Ideas
+    - Data Horror
+---
+
+Problem 3 [link here](https://adventofcode.com/2022/day/3)
+
+This is a fun one.
+We have to do set manipulation on strings and Duck's SQL doesn't have that.
+... or does it?
+
+## Boilerplate for Quarto
+
+```{r}
+library("DBI")
+db = dbConnect(duckdb::duckdb(), dbdir=":memory:")
+knitr::opts_chunk$set(connection="db")
+```
+
+## Set up the database
+
+```{sql}
+CREATE OR REPLACE TABLE rucksacks (contents VARCHAR);
+COPY rucksacks FROM 'input.csv';
+```
+
+Row count validation.
+
+```{sql}
+SELECT COUNT(*) FROM rucksacks
+```
+
+```{bash}
+wc -l input.csv
+```
+
+First rows validation.
+
+```{sql}
+SELECT * FROM rucksacks LIMIT 10
+```
+
+```{bash}
+head -n 10 input.csv
+```
+
+## Part 1
+
+First we need to split each string down the middle. 
+We can use `ARRAY_SLICE` notation for this. 
+The normal slice notation fights with the sql magic extension (which interprets it as a bind parameter).
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_compartments AS (
+    SELECT
+        contents,
+        ARRAY_SLICE(contents, 0, LENGTH(contents)/2) AS compartment_1,
+        ARRAY_SLICE(contents, LENGTH(contents)/2+1, NULL) AS compartment_2,
+        -- for diagnostics
+        LENGTH(contents) AS len_contents,
+        LENGTH(compartment_1) AS len_compartment_1,
+        LENGTH(compartment_2) AS len_compartment_2,
+    FROM rucksacks
+);
+```
+
+Let's take a look at the view.
+
+```{sql}
+SELECT * FROM rucksack_compartments
+```
+
+Let's just validate that the splits are all good.
+
+```{sql}
+SELECT 
+    * 
+FROM rucksack_compartments
+WHERE 
+    len_compartment_1 != len_compartment_2 OR 
+    len_contents != (len_compartment_1 + len_compartment_2)
+```
+
+Looks good, split works. 
+Now for the hard part.
+
+That first row has one f in both compartments. 
+The second one has a lower case `l` (or upper case `I`, I can't tell the difference).
+We'll use these to validate the strategy once it's been tried.
+
+Here's the plan:
+1. The first thing to do is to split each of the compartments into arrays of characters of equal length.
+2. Next, assign a row label to each row.
+3. Unnest the arrays (VIOLENCE) and self join the characters that are equal, keeping distinct rows. This will isolate the character that's the same between the compartments.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_compartment_arrays AS (
+SELECT
+    ROW_NUMBER() OVER () AS row_id,
+    STR_SPLIT(compartment_1, '') AS compartment_1_split,
+    STR_SPLIT(compartment_2, '') AS compartment_2_split,
+FROM
+    rucksack_compartments
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_compartment_arrays
+```
+
+Okay we have our arrays of characters.
+Now to unnest each compartment separately.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_compartment_1_unnested AS (
+    SELECT
+        row_id,
+        UNNEST(compartment_1_split) AS compartment_1_unnested,
+    FROM rucksack_compartment_arrays
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_compartment_1_unnested
+```
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_compartment_2_unnested AS (
+    SELECT
+        row_id,
+        UNNEST(compartment_2_split) AS compartment_2_unnested,
+    FROM rucksack_compartment_arrays
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_compartment_2_unnested
+```
+
+And now, to quote the cinematic masterpiece "Hogzilla",...
+
+![This gon' get nasty](https://media.tenor.com/EUiGZICMcfIAAAAd/hogzilla-the-last-drive-in.gif)
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_common_items AS (
+    SELECT DISTINCT
+        c1.row_id,
+        c1.compartment_1_unnested AS common_item_type,
+    FROM rucksack_compartment_1_unnested AS c1
+    INNER JOIN rucksack_compartment_2_unnested AS c2
+        ON c1.row_id = c2.row_id AND c1.compartment_1_unnested = c2.compartment_2_unnested
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_common_items ORDER BY row_id ASC
+```
+
+Wondrous.
+Now to convert them to numbers and get my answer.
+I _could_ put each one in a table manually and join it.
+But I'm lazy.
+
+DuckDB gives me the [ORD](https://duckdb.org/docs/sql/functions/char) function, which provides a decimal ASCII code of a character.
+
+* A-Z = 65-90
+* a-z = 97-122
+
+Which means, if it's an uppercase I need to subtract 38 and if it's a lower case I need to subtract 96.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_common_item_priorities AS (
+    SELECT
+        row_id,
+        common_item_type,
+        ORD(common_item_type) AS ascii_code,
+        CASE
+            -- I totally just knew these off hand and definitely did not
+            -- look them up.
+            WHEN ascii_code BETWEEN 65 AND 90
+                THEN ascii_code - 38
+            WHEN ascii_code BETWEEN 97 AND 122
+                THEN ascii_code - 96
+            ELSE NULL
+        END AS priority
+    FROM rucksack_common_items
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_common_item_priorities
+```
+
+Okay that was disgusting.
+Let's look for mistakes.
+
+```{sql}
+SELECT 
+    * 
+FROM
+    rucksack_common_item_priorities
+WHERE 
+    (priority IS NULL) OR 
+    (priority <= 0) OR 
+    (priority > 52);
+```
+
+Whew.
+Now for the answer.
+
+```{sql}
+SELECT SUM(priority) FROM rucksack_common_item_priorities
+```
+
+## Part 2
+
+So for the second part of the puzzle, it's the same thing but with groups of three elves (meaning rows).
+We need to find, within each group of three, which item type each member of the group has.
+Starting back at the original view, I'm gonna need row numbers. 
+I can use those to get group IDs by dividing by 3 and taking the ceiling.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_with_groups AS (
+    SELECT
+        ROW_NUMBER() OVER() AS row_id,
+        CEIL(row_id / 3.0)::INTEGER AS row_group,
+        contents
+    FROM rucksacks
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_with_groups
+```
+
+Validate the groups don't have more than 3.
+
+```{sql}
+SELECT 
+    row_group,
+    COUNT(*) 
+FROM 
+    rucksack_with_groups
+GROUP BY 
+    row_group 
+HAVING 
+    COUNT(*) > 3
+```
+
+Good.
+Now let's do some more violence.
+Up first, we want the _within group_ row number. 
+We don't need the absolute row numbers any more, we just need the group number and within-group rows.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_with_group_rows AS (
+    SELECT
+        row_group,
+        ROW_NUMBER() OVER(
+            PARTITION BY row_group ORDER BY row_id ASC
+        ) AS group_member,
+        contents,
+    FROM rucksack_with_groups
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_with_group_rows
+```
+
+Now we can do the same terrible things we did before - three tables with the unnested contents, joined together on row_group and the unnested character they have in common.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_member_one_unnested AS (
+    SELECT
+        row_group,
+        UNNEST(STR_SPLIT(contents,'')) AS item,
+    FROM rucksack_with_group_rows
+    WHERE group_member = 1
+);
+CREATE OR REPLACE VIEW rucksack_member_two_unnested AS (
+    SELECT
+        row_group,
+        UNNEST(STR_SPLIT(contents,'')) AS item,
+    FROM rucksack_with_group_rows
+    WHERE group_member = 2
+);
+CREATE OR REPLACE VIEW rucksack_member_three_unnested AS (
+    SELECT
+        row_group,
+        UNNEST(STR_SPLIT(contents,'')) AS item,
+    FROM rucksack_with_group_rows
+    WHERE group_member = 3
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_member_one_unnested;
+```
+
+Now we can join them back together so we get one row per row_group (ideally), with the character they have in common.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_group_items AS (
+    SELECT DISTINCT
+        g1.row_group,
+        g1.item
+    FROM
+        rucksack_member_one_unnested g1
+    INNER JOIN
+        rucksack_member_two_unnested g2
+        ON g1.row_group = g2.row_group AND g1.item = g2.item
+    INNER JOIN
+        rucksack_member_three_unnested g3
+        ON g1.row_group = g3.row_group AND g1.item = g3.item
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_group_items ORDER BY row_group
+```
+
+```{sql}
+SELECT COUNT(*) FROM rucksack_group_items
+```
+
+Okay we have 100 rows, let's do a little validation.
+Make sure none of the groups have more than one item.
+
+```{sql}
+SELECT 
+    row_group, 
+    COUNT(*) 
+FROM rucksack_group_items 
+GROUP BY row_group 
+HAVING COUNT(*) > 1;
+```
+
+All good, let's copypasta the wretched case statement from earlier and get our answer.
+
+```{sql}
+CREATE OR REPLACE VIEW rucksack_group_priorities AS (
+    SELECT
+        row_group,
+        item,
+        ORD(item) AS ascii_code,
+        CASE
+            WHEN ascii_code BETWEEN 65 AND 90
+                THEN ascii_code - 38
+            WHEN ascii_code BETWEEN 97 AND 122
+                THEN ascii_code - 96
+            ELSE NULL
+        END AS priority
+    FROM rucksack_group_items
+);
+```
+
+```{sql}
+SELECT * FROM rucksack_group_priorities
+```
+
+Look for nulls or invalid values just to be safe.
+
+```{sql}
+SELECT * 
+FROM rucksack_group_priorities
+WHERE 
+    (priority IS NULL) OR 
+    (priority <= 0) OR 
+    (priority > 52)
+```
+
+We're good. Answer time.
+
+```{sql}
+SELECT SUM(priority) FROM rucksack_group_priorities
+```
